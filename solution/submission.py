@@ -1,163 +1,142 @@
-"""Sample submission — the starting point you copy and improve.
 
-A submission is a benchopt solver: a ``submission.py`` defining
-``class Solver(GeneCompetSolver)``.
-
-This baseline decomposes normalized log-expression into marginal additive
-effects per gene and per condition, then calibrates a single Negative-Binomial
-dispersion sigma on the training set:
-    log1p(mu_{g, s}) = mu_0 + alpha_g + beta_s + offset_{g, s}
-where offset_{g, s} = log_size_factor_s + log_length_ratio_g.
-
-Run it locally exactly as the platform does::
-
-    python tools/setup_data.py
-    BENCHOPT_DATA_HOME=phases/main/input_data/data \\
-        benchopt run benchmark -d BacterialExpression -s solution/submission.py
-
-Ideas to improve it:
-- Gradient boosting (e.g. CatBoost, LightGBM) on gene x condition interactions
-- Sequence representations from genomes (promoter k-mers, learned encoders)
-- Graph neural networks leveraging the homology & proximity graph
-"""
+"""CatBoost submission for bacterial gene expression prediction."""
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize_scalar
 
+from catboost import CatBoostRegressor
 from benchmark_utils.base_solver import GeneCompetSolver
 from benchmark_utils.nb_loss import nb_nll
 
 
-class SubmissionModel:
+def extract_features(df):
+    """Extract categorical IDs and numerical normalization offsets."""
 
-    def __init__(self, shrinkage: float = 1.0):
-        self.shrinkage = float(shrinkage)
-        self.mu_0 = 0.0
-        self.gene_effects = {}
-        self.cond_effects = {}
+    cat_cols = ["genome_id", "feature_id", "run_accession"]
+    num_cols = ["log_length_ratio", "log_size_factor"]
+
+    X = pd.DataFrame(index=df.index)
+
+    for col in cat_cols:
+        if col in df.columns:
+            X[col] = df[col].fillna("missing").astype(str)
+        else:
+            X[col] = "missing"
+
+    for col in num_cols:
+        if col in df.columns:
+            X[col] = pd.to_numeric(
+                df[col], errors="coerce"
+            ).fillna(0.0)
+        else:
+            X[col] = 0.0
+
+    return X, cat_cols
+
+
+class CatBoostSubmission:
+
+    def __init__(self, iterations=150, lr=0.1):
+        self.iterations = iterations
+        self.lr = lr
+        self.model = None
         self.sigma = 1.0
 
-    def fit(self, train_df: pd.DataFrame, samples_df=None, genomes_dir=None):
+    def fit(self, train_df, samples_df=None, genomes_dir=None):
+
         target_col = (
             "readcount" if "readcount" in train_df.columns else "counts"
         )
+
         y = train_df[target_col].to_numpy(dtype=float)
+        X, cat_cols = extract_features(train_df)
 
-        llr = (
-            train_df["log_length_ratio"].to_numpy(dtype=float)
-            if "log_length_ratio" in train_df.columns
-            else np.zeros(len(train_df))
-        )
-        lsf = (
-            train_df["log_size_factor"].to_numpy(dtype=float)
-            if "log_size_factor" in train_df.columns
-            else np.zeros(len(train_df))
-        )
-        offset = llr + lsf
+        # Split data to select the NB dispersion.
+        n = len(y)
 
-        # Composite IDs
-        if "gene_uid" in train_df.columns:
-            gene_ids = train_df["gene_uid"].astype(str).values
-        else:
-            gene_ids = (
-                train_df["genome_id"].astype(str)
-                + "_"
-                + train_df["feature_id"].astype(str)
-            ).values
+        if n >= 2:
+            rng = np.random.default_rng(42)
+            indices = rng.permutation(n)
 
-        if "condition_uid" in train_df.columns:
-            cond_ids = train_df["condition_uid"].astype(str).values
-        else:
-            cond_ids = (
-                train_df["genome_id"].astype(str)
-                + "_"
-                + train_df["run_accession"].astype(str)
-            ).values
+            val_size = min(max(int(0.15 * n), 10), n - 1)
 
-        # Normalized log counts
-        log_y = np.log1p(y) - offset
-        self.mu_0 = float(np.mean(log_y))
-        y_centered = log_y - self.mu_0
+            val_idx = indices[:val_size]
+            train_idx = indices[val_size:]
 
-        # Gene effects with shrinkage
-        lam = self.shrinkage
-        df_genes = pd.DataFrame({"gene": gene_ids, "val": y_centered})
-        g_stats = df_genes.groupby("gene")["val"].agg(["sum", "count"])
-        self.gene_effects = (
-            g_stats["sum"] / (g_stats["count"] + lam)
-        ).to_dict()
+            X_train = X.iloc[train_idx]
+            X_val = X.iloc[val_idx]
 
-        # Condition effects with shrinkage
-        alpha_vec = np.array([self.gene_effects.get(g, 0.0) for g in gene_ids])
-        resid = y_centered - alpha_vec
-        df_conds = pd.DataFrame({"cond": cond_ids, "val": resid})
-        c_stats = df_conds.groupby("cond")["val"].agg(["sum", "count"])
-        self.cond_effects = (
-            c_stats["sum"] / (c_stats["count"] + lam)
-        ).to_dict()
+            y_train = y[train_idx]
+            y_val = y[val_idx]
 
-        # Calibrate dispersion sigma
-        beta_vec = np.array([self.cond_effects.get(c, 0.0) for c in cond_ids])
-        log_pred = self.mu_0 + alpha_vec + beta_vec + offset
-        mu_fit = np.maximum(np.expm1(np.clip(log_pred, -15.0, 15.0)), 0.5)
+            validation_model = CatBoostRegressor(
+                iterations=self.iterations,
+                learning_rate=self.lr,
+                cat_features=cat_cols,
+                loss_function="RMSE",
+                verbose=0,
+                random_seed=42,
+                allow_writing_files=False,
+            )
 
-        res = minimize_scalar(
-            lambda log_r: nb_nll(y, mu_fit, np.exp(log_r)),
-            bounds=(-4.0, 8.0),
-            method="bounded",
-        )
-        self.sigma = float(np.exp(res.x))
+            validation_model.fit(
+                X_train,
+                np.log1p(np.clip(y_train, 0.0, None)),
+            )
+
+            pred_log = validation_model.predict(X_val)
+            mu_val = np.maximum(
+                np.expm1(np.clip(pred_log, -15.0, 15.0)),
+                0.5,
+            )
+
+            # Select dispersion using validation NB-NLL.
+            candidates = [0.5, 1.0, 2.0, 5.0, 10.0]
+
+            losses = [
+                nb_nll(y_val, mu_val, r)
+                for r in candidates
+            ]
+
+            self.sigma = float(candidates[np.argmin(losses)])
+
+        
+        self.model = validation_model
+
         return self
 
-    def predict(
-        self, test_df: pd.DataFrame, samples_df=None, genomes_dir=None
-    ):
-        n = len(test_df)
-        llr = (
-            test_df["log_length_ratio"].to_numpy(dtype=float)
-            if "log_length_ratio" in test_df.columns
-            else np.zeros(n)
+    def predict(self, test_df, samples_df=None, genomes_dir=None):
+
+        X, _ = extract_features(test_df)
+
+        pred_log = self.model.predict(X)
+
+        mu = np.maximum(
+            np.expm1(np.clip(pred_log, -15.0, 15.0)),
+            0.5,
         )
-        lsf = (
-            test_df["log_size_factor"].to_numpy(dtype=float)
-            if "log_size_factor" in test_df.columns
-            else np.zeros(n)
-        )
-        offset = llr + lsf
 
-        if "gene_uid" in test_df.columns:
-            gene_ids = test_df["gene_uid"].astype(str).values
-        else:
-            gene_ids = (
-                test_df["genome_id"].astype(str)
-                + "_"
-                + test_df["feature_id"].astype(str)
-            ).values
+        sigma = np.full(len(test_df), self.sigma)
 
-        if "condition_uid" in test_df.columns:
-            cond_ids = test_df["condition_uid"].astype(str).values
-        else:
-            cond_ids = (
-                test_df["genome_id"].astype(str)
-                + "_"
-                + test_df["run_accession"].astype(str)
-            ).values
-
-        alpha = np.array([self.gene_effects.get(g, 0.0) for g in gene_ids])
-        beta = np.array([self.cond_effects.get(c, 0.0) for c in cond_ids])
-
-        log_pred = self.mu_0 + alpha + beta + offset
-        mu = np.maximum(np.expm1(np.clip(log_pred, -15.0, 15.0)), 0.5)
-        return np.column_stack([mu, np.full(n, self.sigma)])
+        return np.column_stack([mu, sigma])
 
 
 class Solver(GeneCompetSolver):
 
     name = "submission"
 
+    requirements = ["pip::catboost"]
+
+    parameters = {
+        "iterations": [150],
+        "lr": [0.1],
+    }
+
     def get_model(self, meta):
-        return SubmissionModel(shrinkage=1.0)
+        return CatBoostSubmission(
+            iterations=self.iterations,
+            lr=self.lr,
+        )
 
     def fit(self, model, train_df, samples_df, genomes_dir):
         model.fit(train_df, samples_df, genomes_dir)
