@@ -19,15 +19,28 @@ def extract_features(df):
 
     for col in cat_cols:
         if col in df.columns:
-            X[col] = df[col].fillna("missing").astype(str)
+            values = df[col]
+
+            if isinstance(values.dtype, pd.CategoricalDtype):
+                if values.isna().any():
+                    values = (
+                        values.cat
+                        .add_categories(["__MISSING__"])
+                        .fillna("__MISSING__")
+                    )
+            else:
+                values = values.fillna("__MISSING__").astype("category")
+
+            X[col] = values
         else:
-            X[col] = "missing"
+            X[col] = pd.Series(
+                pd.Categorical(["__MISSING__"] * len(df)),
+                index=df.index,
+            )
 
     for col in num_cols:
         if col in df.columns:
-            X[col] = pd.to_numeric(
-                df[col], errors="coerce"
-            ).fillna(0.0)
+            X[col] = df[col].fillna(0.0)
         else:
             X[col] = 0.0
 
@@ -48,6 +61,11 @@ class CatBoostSubmission:
             "readcount" if "readcount" in train_df.columns else "counts"
         )
 
+        if len(train_df) > 2_000_000:
+            train_df = train_df.sample(
+                n=2_000_000,
+                random_state=42,
+                )
         y = train_df[target_col].to_numpy(dtype=float)
         X, cat_cols = extract_features(train_df)
 
@@ -75,6 +93,7 @@ class CatBoostSubmission:
                 cat_features=cat_cols,
                 loss_function="RMSE",
                 verbose=0,
+                thread_count=4,
                 random_seed=42,
                 allow_writing_files=False,
             )
